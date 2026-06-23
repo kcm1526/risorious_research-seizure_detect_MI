@@ -253,6 +253,26 @@ def build_input_replacement(x: torch.Tensor, mode: str, noise_scale: float = 1.0
     raise ValueError(f"Unknown mask replacement mode: {mode}")
 
 
+def input_mask_from_attribution(
+    attribution: torch.Tensor,
+    x: torch.Tensor,
+    args,
+) -> torch.Tensor:
+    if args.mask_scope == "time":
+        time_scores = attribution.mean(dim=1)
+        time_mask = top_fraction_mask(
+            time_scores,
+            fraction=args.mask_fraction,
+            largest=args.mask_target == "highest",
+        )
+        return time_mask.unsqueeze(1).expand_as(x)
+    return top_fraction_mask(
+        attribution,
+        fraction=args.mask_fraction,
+        largest=args.mask_target == "highest",
+    )
+
+
 def input_attribution(
     model: SeizureTransformer,
     x: torch.Tensor,
@@ -290,20 +310,7 @@ def attribution_guided_masking(
         threshold=args.threshold,
         attribution_kind=args.attribution_kind,
     )
-    if args.mask_scope == "time":
-        time_scores = attribution.mean(dim=1)
-        time_mask = top_fraction_mask(
-            time_scores,
-            fraction=args.mask_fraction,
-            largest=args.mask_target == "highest",
-        )
-        mask = time_mask.unsqueeze(1).expand_as(x)
-    else:
-        mask = top_fraction_mask(
-            attribution,
-            fraction=args.mask_fraction,
-            largest=args.mask_target == "highest",
-        )
+    mask = input_mask_from_attribution(attribution, x, args)
     replacement = build_input_replacement(x, args.mask_replacement, args.noise_scale)
     x_masked = torch.where(mask, replacement, x)
     with torch.no_grad():
@@ -342,17 +349,30 @@ def intervene_latent(
     attribution: torch.Tensor,
     args,
 ) -> torch.Tensor:
+    mask = latent_mask_from_attribution(attribution, args)
+    return apply_latent_intervention(latent, mask, args)
+
+
+def latent_mask_from_attribution(
+    attribution: torch.Tensor,
+    args,
+) -> torch.Tensor:
     if args.latent_scope == "time":
         scores = attribution.mean(dim=1)
         time_mask = top_fraction_mask(scores, fraction=args.latent_fraction, largest=True)
-        mask = time_mask.unsqueeze(1).expand_as(latent)
-    elif args.latent_scope == "channel":
+        return time_mask.unsqueeze(1).expand_as(attribution)
+    if args.latent_scope == "channel":
         scores = attribution.mean(dim=2)
         channel_mask = top_fraction_mask(scores, fraction=args.latent_fraction, largest=True)
-        mask = channel_mask.unsqueeze(2).expand_as(latent)
-    else:
-        mask = top_fraction_mask(attribution, fraction=args.latent_fraction, largest=True)
+        return channel_mask.unsqueeze(2).expand_as(attribution)
+    return top_fraction_mask(attribution, fraction=args.latent_fraction, largest=True)
 
+
+def apply_latent_intervention(
+    latent: torch.Tensor,
+    mask: torch.Tensor,
+    args,
+) -> torch.Tensor:
     if args.latent_intervention == "suppress":
         replacement = torch.zeros_like(latent)
         return torch.where(mask, replacement, latent)
@@ -383,6 +403,226 @@ def mi_guided_latent_intervention(
     intervened = intervene_latent(latent, attribution, args)
     with torch.no_grad():
         return access.decode_from_latent(intervened, skips).detach(), attribution.detach()
+
+
+def mask_to_ranges(mask: np.ndarray, step_samples: float, fs: int, max_ranges: int = 12) -> List[Dict[str, float]]:
+    ranges = []
+    start = None
+    for index, value in enumerate(mask.astype(bool)):
+        if value and start is None:
+            start = index
+        elif not value and start is not None:
+            ranges.append(
+                {
+                    "start_step": int(start),
+                    "end_step": int(index),
+                    "start_sec": float(start * step_samples / fs),
+                    "end_sec": float(index * step_samples / fs),
+                }
+            )
+            start = None
+    if start is not None:
+        index = len(mask)
+        ranges.append(
+            {
+                "start_step": int(start),
+                "end_step": int(index),
+                "start_sec": float(start * step_samples / fs),
+                "end_sec": float(index * step_samples / fs),
+            }
+        )
+    return ranges[:max_ranges]
+
+
+def top_indices(scores: np.ndarray, k: int = 12) -> List[Dict[str, float]]:
+    flat = np.asarray(scores).reshape(-1)
+    if flat.size == 0:
+        return []
+    k = min(k, flat.size)
+    indices = np.argsort(flat)[-k:][::-1]
+    return [{"index": int(index), "score": float(flat[index])} for index in indices]
+
+
+def append_jsonl(path: Path, row: Dict[str, object]):
+    with path.open("a") as fp:
+        fp.write(json.dumps(row) + "\n")
+
+
+def should_save_example(label: torch.Tensor, baseline: torch.Tensor, threshold: float) -> bool:
+    return bool((label > 0.5).any().item() or (baseline > threshold).any().item())
+
+
+def save_interpretability_example(
+    model: SeizureTransformer,
+    access: SeizureTransformerAccess,
+    x: torch.Tensor,
+    labels: torch.Tensor,
+    baseline: torch.Tensor,
+    args,
+    example_dir: Path,
+    manifest_path: Path,
+    edf_path: str,
+    recording_index: int,
+    window_index: int,
+    example_id: int,
+):
+    xi = x.detach()
+    yi = labels.detach()
+    baseline = baseline.detach()
+
+    _, input_attr = input_attribution(
+        model=model,
+        x=xi,
+        labels=yi,
+        objective_strategy=args.objective,
+        threshold=args.threshold,
+        attribution_kind=args.attribution_kind,
+    )
+    input_mask = input_mask_from_attribution(input_attr, xi, args)
+    replacement = build_input_replacement(xi, args.mask_replacement, args.noise_scale)
+    masked_input = torch.where(input_mask, replacement, xi)
+    with torch.no_grad():
+        masked_prediction = model(masked_input).detach()
+
+    _, latent, latent_attr, skips = latent_attribution(
+        access=access,
+        x=xi,
+        labels=yi,
+        objective_strategy=args.objective,
+        threshold=args.threshold,
+        attribution_kind=args.attribution_kind,
+    )
+    latent_mask = latent_mask_from_attribution(latent_attr, args)
+    intervened_latent = apply_latent_intervention(latent, latent_mask, args)
+    with torch.no_grad():
+        latent_prediction = access.decode_from_latent(intervened_latent, skips).detach()
+
+    input_np = xi.squeeze(0).detach().cpu().numpy()
+    label_np = yi.squeeze(0).detach().cpu().numpy()
+    baseline_np = baseline.squeeze(0).detach().cpu().numpy()
+    input_attr_np = input_attr.squeeze(0).detach().cpu().numpy()
+    input_mask_np = input_mask.squeeze(0).detach().cpu().numpy().astype(bool)
+    masked_input_np = masked_input.squeeze(0).detach().cpu().numpy()
+    masked_prediction_np = masked_prediction.squeeze(0).detach().cpu().numpy()
+    latent_np = latent.squeeze(0).detach().cpu().numpy()
+    latent_attr_np = latent_attr.squeeze(0).detach().cpu().numpy()
+    latent_mask_np = latent_mask.squeeze(0).detach().cpu().numpy().astype(bool)
+    latent_prediction_np = latent_prediction.squeeze(0).detach().cpu().numpy()
+
+    input_time_scores = input_attr_np.mean(axis=0)
+    input_channel_scores = input_attr_np.mean(axis=1)
+    input_time_mask = input_mask_np.any(axis=0)
+    latent_time_scores = latent_attr_np.mean(axis=0)
+    latent_channel_scores = latent_attr_np.mean(axis=1)
+    latent_time_mask = latent_mask_np.any(axis=0)
+    latent_channel_mask = latent_mask_np.any(axis=1)
+    latent_step_samples = args.window_size / latent_attr_np.shape[-1]
+
+    stem = f"example_{example_id:04d}"
+    artifact_path = example_dir / f"{stem}.npz"
+    np.savez_compressed(
+        artifact_path,
+        input=input_np,
+        label=label_np,
+        baseline_prediction=baseline_np,
+        input_attribution=input_attr_np,
+        input_attribution_time=input_time_scores,
+        input_attribution_channel=input_channel_scores,
+        input_mask=input_mask_np,
+        input_mask_time=input_time_mask,
+        masked_input=masked_input_np,
+        masked_prediction=masked_prediction_np,
+        latent=latent_np,
+        latent_attribution=latent_attr_np,
+        latent_attribution_time=latent_time_scores,
+        latent_attribution_channel=latent_channel_scores,
+        latent_mask=latent_mask_np,
+        latent_mask_time=latent_time_mask,
+        latent_mask_channel=latent_channel_mask,
+        latent_prediction=latent_prediction_np,
+        fs=np.array(args.fs),
+    )
+
+    metadata = {
+        "example_id": example_id,
+        "artifact": str(artifact_path),
+        "edf": edf_path,
+        "recording_index": recording_index,
+        "window_index": window_index,
+        "start_sample": int(window_index * args.window_size),
+        "start_sec": float(window_index * args.window_size / args.fs),
+        "window_size": args.window_size,
+        "fs": args.fs,
+        "objective": args.objective,
+        "attribution_kind": args.attribution_kind,
+        "mask_scope": args.mask_scope,
+        "mask_fraction": args.mask_fraction,
+        "mask_replacement": args.mask_replacement,
+        "input_masked_fraction": float(input_mask_np.mean()),
+        "input_masked_time_ranges": mask_to_ranges(input_time_mask, step_samples=1.0, fs=args.fs),
+        "top_input_times": top_indices(input_time_scores, args.example_top_k),
+        "top_input_channels": top_indices(input_channel_scores, args.example_top_k),
+        "latent_scope": args.latent_scope,
+        "latent_fraction": args.latent_fraction,
+        "latent_intervention": args.latent_intervention,
+        "latent_strength": args.latent_strength,
+        "latent_masked_fraction": float(latent_mask_np.mean()),
+        "latent_masked_time_ranges": mask_to_ranges(
+            latent_time_mask,
+            step_samples=latent_step_samples,
+            fs=args.fs,
+        ),
+        "top_latent_times": top_indices(latent_time_scores, args.example_top_k),
+        "top_latent_channels": top_indices(latent_channel_scores, args.example_top_k),
+        "label_positive_rate": float(label_np.mean()),
+        "baseline_mean_prediction": float(baseline_np.mean()),
+        "masked_mean_prediction": float(masked_prediction_np.mean()),
+        "latent_mean_prediction": float(latent_prediction_np.mean()),
+        "baseline_peak_prediction": float(baseline_np.max()),
+        "masked_peak_prediction": float(masked_prediction_np.max()),
+        "latent_peak_prediction": float(latent_prediction_np.max()),
+    }
+    append_jsonl(manifest_path, metadata)
+
+
+def save_batch_examples(
+    model: SeizureTransformer,
+    access: SeizureTransformerAccess,
+    x: torch.Tensor,
+    labels: torch.Tensor,
+    baseline: torch.Tensor,
+    args,
+    example_state: Dict[str, int],
+    example_dir: Path,
+    manifest_path: Path,
+    edf_path: str,
+    recording_index: int,
+    batch_start_window: int,
+):
+    if example_state["saved"] >= args.max_examples:
+        return
+
+    for batch_index in range(x.shape[0]):
+        if example_state["saved"] >= args.max_examples:
+            break
+        if not should_save_example(labels[batch_index], baseline[batch_index], args.threshold):
+            continue
+        example_id = example_state["saved"]
+        save_interpretability_example(
+            model=model,
+            access=access,
+            x=x[batch_index : batch_index + 1],
+            labels=labels[batch_index : batch_index + 1],
+            baseline=baseline[batch_index : batch_index + 1],
+            args=args,
+            example_dir=example_dir,
+            manifest_path=manifest_path,
+            edf_path=edf_path,
+            recording_index=recording_index,
+            window_index=batch_start_window + batch_index,
+            example_id=example_id,
+        )
+        example_state["saved"] += 1
 
 
 def batch_delta_stats(
@@ -500,6 +740,10 @@ def run_recording(
     label_path: str,
     args,
     device: torch.device,
+    recording_index: int = 0,
+    example_state: Optional[Dict[str, int]] = None,
+    example_dir: Optional[Path] = None,
+    example_manifest_path: Optional[Path] = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, float]], Dict[str, Dict[str, float]], np.ndarray]:
     data, reference = load_recording(edf_path, label_path)
     if data.shape[1] < args.window_size:
@@ -511,6 +755,7 @@ def run_recording(
     outputs = {method: [] for method in args.methods}
     baseline_chunks = []
     attribution_stats = defaultdict(MeanAccumulator)
+    seen_windows = 0
 
     for batch in dataloader:
         x, labels = batch
@@ -520,6 +765,9 @@ def run_recording(
         with torch.no_grad():
             baseline = model(x).detach()
         baseline_chunks.append(baseline.cpu().numpy())
+
+        batch_start_window = seen_windows
+        seen_windows += x.shape[0]
 
         if METHOD_ATTRIBUTION_ONLY in args.methods:
             attr_output, attribution = input_attribution(
@@ -547,6 +795,27 @@ def run_recording(
             outputs[METHOD_LATENT_INTERVENTION].append(intervened_output.cpu().numpy())
             attribution_stats[METHOD_LATENT_INTERVENTION].add(
                 attribution_alignment_stats(latent_attr, labels, expected_length=labels.shape[-1])
+            )
+
+        if (
+            args.save_examples
+            and example_state is not None
+            and example_dir is not None
+            and example_manifest_path is not None
+        ):
+            save_batch_examples(
+                model=model,
+                access=access,
+                x=x,
+                labels=labels,
+                baseline=baseline,
+                args=args,
+                example_state=example_state,
+                example_dir=example_dir,
+                manifest_path=example_manifest_path,
+                edf_path=edf_path,
+                recording_index=recording_index,
+                batch_start_window=batch_start_window,
             )
 
     baseline_pred = flatten_prediction(np.concatenate(baseline_chunks, axis=0), len(reference_np))
@@ -609,6 +878,14 @@ def run_experiment(args):
     aggregate_attr = {method: MeanAccumulator() for method in args.methods}
     rows = []
     skipped = []
+    example_state = {"saved": 0}
+    example_dir = None
+    example_manifest_path = None
+    if args.save_examples:
+        example_dir = resolve_path(args.example_dir) if args.example_dir else output_dir / "examples"
+        example_dir.mkdir(parents=True, exist_ok=True)
+        example_manifest_path = example_dir / "manifest.jsonl"
+        example_manifest_path.write_text("")
 
     for index, (edf_path, label_path) in enumerate(zip(file_list, label_list)):
         print(f"[{index + 1}/{len(file_list)}] {edf_path}")
@@ -620,6 +897,10 @@ def run_experiment(args):
                 label_path=label_path,
                 args=args,
                 device=device,
+                recording_index=index,
+                example_state=example_state,
+                example_dir=example_dir,
+                example_manifest_path=example_manifest_path,
             )
         except Exception as exc:
             skipped.append({"edf": edf_path, "error": repr(exc)})
@@ -680,6 +961,10 @@ def parse_args():
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--max_files", type=int, default=None)
     parser.add_argument("--save_npz", action="store_true")
+    parser.add_argument("--save_examples", action="store_true")
+    parser.add_argument("--max_examples", type=int, default=8)
+    parser.add_argument("--example_dir", type=str, default=None)
+    parser.add_argument("--example_top_k", type=int, default=12)
 
     parser.add_argument("--window_size", type=int, default=15360)
     parser.add_argument("--num_channel", type=int, default=18)
